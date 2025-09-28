@@ -25,7 +25,7 @@ class XianzhiCrawler {
     async init() {
         console.log('启动浏览器...');
         this.browser = await chromium.launch({ 
-            headless: false, // 设为false可以看到浏览器操作过程
+            headless: true, // 设为false可以看到浏览器操作过程
         });
         
         const context = await this.browser.newContext({

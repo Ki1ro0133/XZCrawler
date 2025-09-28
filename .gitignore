@@ -17,6 +17,6 @@ yarn-error.log*
 .idea/
 
 # Generated summaries (optional to ignore if you prefer)
-SUMMARY-*.md
+SUMMARY*.md
 papers/
 package-lock.json
