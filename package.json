@@ -1,0 +1,24 @@
+{
+  "name": "xianzhi-crawler",
+  "version": "1.0.0",
+  "description": "先知社区文章爬虫",
+  "main": "xianzhi_crawler.js",
+  "scripts": {
+    "start": "node xianzhi_crawler.js",
+    "images-only": "node xianzhi_crawler.js --images-only",
+    "range-2025Q3": "node xianzhi_crawler.js --start-date=2025-07-01 --end-date=2025-09-30 --max-pages=10",
+    "after-2024": "node xianzhi_crawler.js --target-date=2024-01-01 --max-pages=5",
+    "install-browsers": "npx playwright install"
+  },
+  "dependencies": {
+    "jsdom": "^27.0.0",
+    "playwright": "^1.40.0"
+  },
+  "keywords": [
+    "crawler",
+    "playwright",
+    "xianzhi"
+  ],
+  "author": "",
+  "license": "MIT"
+}
