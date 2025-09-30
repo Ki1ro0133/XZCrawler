@@ -2,21 +2,9 @@
 
 先知社区（xz.aliyun.com）文章爬虫与 Markdown 转换工具。
 
-- 自动点击“社区板块”后再开始爬取，确保抓取的是社区文章列表
-- 提取文章标题、作者、分类、发布时间及正文
-- 强化的 Markdown 转换：
-  - ne-viewer 自定义节点适配（段落/标题/列表/表格/卡片等）
-  - 代码块精准提取（CodeMirror 行拼接、语言识别，绝不逐行包裹 ```）
-  - 内联代码反引号安全包裹（自动扩展反引号长度）
-  - 文本尖括号转义，避免被 Markdown 当作 HTML 标签
-- 图片本地化：
-  - 抓取时识别懒加载属性并解析相对路径
-  - 可遍历现有 `papers/*.md`，带 Referer 下载远端图片并重写为本地相对路径（images-only 模式）
-- 可配置的时间过滤：支持开始/结束日期或单一阈值日期
-- 参数化：CLI > ENV > `config.json`，三种方式可选
-- 产物：
-  - 每篇文章一个 Markdown 文件，保存在 `papers/`
-  - 自动生成索引汇总 `SUMMARY-<timestamp>.md`
+- 采用Playwright作为基础爬虫框架，可以有效绕过最新版先知社区的反爬机制。
+- 因为最新版先知社区现在文章采用ne-viewer作为文章渲染工具，针对该html标签自定义一套markdown转换。
+- 图片本地化：图片本地化与文章爬取不统一进行，使用 `npm run images-only` 进行图片本地化。
 
 ## 目录
 - [环境要求](#环境要求)
@@ -25,7 +13,8 @@
 - [参数与用法](#参数与用法)
 - [配置文件](#配置文件)
 - [输出说明](#输出说明)
-- [常见问题](#常见问题)
+- [合规说明](#合规说明)
+- [许可证](#许可证)
 
 ## 环境要求
 - Node.js 16+（建议 18+）
@@ -49,7 +38,7 @@ npm run images-only
 ```bash
 npm run range-2025Q3
 ```
-- 指定阈值日期（老参数兼容方式）：
+- 指定时间日期为2024年以后的文章：
 ```bash
 npm run after-2024
 ```
@@ -62,13 +51,16 @@ npm run after-2024
   - `--end-date=YYYY-MM-DD`：结束日期（含）
   - `--target-date=YYYY-MM-DD`：单一阈值（表示“此日期之后”），仅当未提供 start/end 时生效
   - `--max-pages=10`：最大翻页数
-  - `--images-only`：只进行图片本地化，不进行浏览器爬取
+  - `--images-only`：图片本地化模式，不进行浏览器爬取
+  - `--image`：抓取完成后自动对 `papers/*.md` 中的图片进行本地化
+  - `--concurrency=3`：详情页抓取并发数（别名：`--conc` / `--parallel`），建议 3~6 之间
 
 示例：
 ```bash
 node xianzhi_crawler.js --start-date=2025-07-01 --end-date=2025-09-30 --max-pages=10
 node xianzhi_crawler.js --target-date=2024-01-01 --max-pages=5
 node xianzhi_crawler.js --images-only
+node xianzhi_crawler.js --target-date=2024-01-01 --max-pages=8 --concurrency=5
 ```
 
 - 环境变量（在 CLI 未提供时生效，接受多种大小写/风格）
@@ -77,6 +69,8 @@ node xianzhi_crawler.js --images-only
   - `TARGET_DATE` / `targetDate`
   - `MAX_PAGES` / `maxPages`
   - `IMAGES_ONLY` / `imagesOnly`（`true`/`false`）
+  - `IMAGE` / `image`（`true`/`false`）
+  - `CONCURRENCY` / `concurrency` / `conc` / `parallel`
 
 示例：
 ```bash
@@ -95,16 +89,43 @@ node xianzhi_crawler.js
   "targetDate": null,
   "maxPages": 1,
   "imagesOnly": false,
-  "fetchFullContent": true
+  "image": true,
+  "fetchFullContent": true,
+  "concurrency": 3
 }
 ```
 
 ## 输出说明
-- 单篇文章文件：`papers/<标题处理>.md`
+- 单篇文章文件：`papers/<标题>.md`
 - 图片目录：`papers/images/`
 - 索引汇总：`SUMMARY-<timestamp>.md`
+- 实时索引汇总：`SUMMARY-REALTIME.md`
+
+**示例目录结构：**
+
+```
+XZCrawler/
+├─ papers/
+│  ├─ 某数据泄露防护系统审计.md
+│  ├─ 记一次对某OA的代码审计.md
+│  └─ images/
+│     └─ xxx.png
+├─ SUMMARY-REALTIME.md
+├─ SUMMARY-2025-09-30T12-00-00.md
+└─ xianzhi_crawler.js
+```
+
+**SUMMARY 链接示例：**
+
+```markdown
+| 1 | [某数据泄露防护系统审计](papers/某数据泄露防护系统审计.md) | 安全研究 | 张三 | 2025-09-29 |
+```
 
 > 注：索引会统计分类、日期分布以及列出最新文章。
+
+
+## 合规声明
+本工具仅用于学习与研究，请遵守目标网站的服务条款与当地法律法规。
 
 ## 许可证
 MIT

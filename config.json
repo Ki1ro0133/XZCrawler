@@ -3,6 +3,8 @@
   "endDate": null,
   "targetDate": null,
   "maxPages": 1,
-  "imagesOnly": true,
-  "fetchFullContent": true
+  "imagesOnly": false,
+  "image": true,
+  "fetchFullContent": true,
+  "concurrency": 3
 }

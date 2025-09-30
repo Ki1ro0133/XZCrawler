@@ -9,7 +9,7 @@ const { JSDOM } = require('jsdom');
 class XianzhiCrawler {
     constructor(options = {}) {
         this.baseUrl = 'https://xz.aliyun.com/news';
-        // 过滤时间：支持 startDate/endDate 或单一 targetDate（向后兼容）
+        // 过滤时间：支持 startDate/endDate 或单一 targetDate
         this.startDate = options.startDate ? new Date(options.startDate) : null;
         this.endDate = options.endDate ? new Date(options.endDate) : null;
         this.targetDate = options.targetDate ? new Date(options.targetDate) : (this.startDate || null);
@@ -20,6 +20,14 @@ class XianzhiCrawler {
         this.maxPages = options.maxPages || 1; // 最大爬取页数
         this.debugSaved = false; // 调试标志
         this.imagesOnly = !!options.imagesOnly; // 仅进行本地图片下载
+        this.image = !!options.image; // 抓取完成后是否本地化图片
+        this.aborted = false; // 中断标志（Ctrl-C）
+        this._onSigint = null;
+        this._onSigterm = null;
+        this.concurrency = Number(options.concurrency) > 0 ? Number(options.concurrency) : 3; // 并发抓取文章详情
+        this.failures = []; // 失败记录
+        this._summaryUpdateCounter = 0; // 汇总更新节流计数器
+        this._seenKeys = new Set(); // 去重键（link 优先）
     }
 
     async init() {
@@ -53,7 +61,7 @@ class XianzhiCrawler {
                     console.log('找到社区板块标签，点击切换...');
                     await communityTab.click();
                     // 等待社区板块标签被选中
-                    await this.page.waitForLoadState("networkidle");
+                    await this.page.waitForLoadState("load");
                     console.log('已切换到社区板块');
                 } else {
                     console.log('未找到社区板块标签，可能已经在社区板块页面');
@@ -69,22 +77,21 @@ class XianzhiCrawler {
 
     async scrapeArticles() {
         console.log('开始爬取文章...');
-        
+
         let hasMorePages = true;
         let currentPage = 1;
         let totalArticles = 0;
-        
-        while (hasMorePages && currentPage <= this.maxPages) {
-            console.log(`\n=== 爬取第 ${currentPage} 页 ===`);
-            
-            // 等待新闻列表加载
-            await this.page.waitForSelector('#news_list .news_item', { timeout: 10000 });
 
-            await this.page.waitForTimeout(3000); // 等待三秒钟
-            
+        while (hasMorePages && currentPage <= this.maxPages) {
+            if (this.aborted) {
+                console.log('检测到中断，停止爬取');
+                break;
+            }
+
+            console.log(`\n=== 爬取第 ${currentPage} 页 ===`);
+
             // 获取当前页面的文章
             const articlesOnPage = await this.extractArticlesFromPage();
-            
             if (articlesOnPage.length === 0) {
                 console.log('当前页面没有找到文章，停止爬取');
                 break;
@@ -99,7 +106,6 @@ class XianzhiCrawler {
                     if (this.startDate) include = include && (articleDate >= this.startDate);
                     if (this.endDate) include = include && (articleDate <= this.endDate);
                     if (!this.startDate && !this.endDate && this.targetDate) {
-                        // 仅提供了单一阈值日期（向后兼容旧逻辑）
                         include = include && (articleDate > this.targetDate);
                     }
                     return include;
@@ -108,41 +114,85 @@ class XianzhiCrawler {
                     return false;
                 }
             });
-            
-            // 如果需要获取完整内容，则访问每篇文章页面
+
             if (this.fetchFullContent) {
-                for (let i = 0; i < filteredArticles.length; i++) {
-                    try {
-                        console.log(`获取第 ${i + 1}/${filteredArticles.length} 篇文章的完整内容...`);
-                        const articleData = await this.fetchArticleContent(filteredArticles[i].link);
-                        filteredArticles[i].content = articleData.content;
-                        // 如果页面标题更准确，更新标题
-                        if (articleData.title && articleData.title !== '未知标题' && articleData.title !== '访问失败') {
-                            filteredArticles[i].title = articleData.title;
+                // 使用简单并发池抓取详情
+                const poolSize = Math.max(1, this.concurrency);
+                let idx = 0;
+                const runOne = async () => {
+                    while (idx < filteredArticles.length && !this.aborted) {
+                        const i = idx++;
+                        const item = filteredArticles[i];
+                        // 去重（优先使用 link 作为 key）
+                        const key = (item.link && item.link.trim()) || `${(item.title || '').trim()}|${item.publishTime || ''}`;
+                        if (this._seenKeys.has(key)) {
+                            console.log('🔁 重复文章，跳过抓取与统计');
+                            continue;
                         }
-                        await this.page.waitForTimeout(1500); // 避免请求过快
-                    } catch (error) {
-                        console.log(`获取文章内容失败: ${error.message}`);
-                        filteredArticles[i].content = '获取内容失败: ' + error.message;
+                        try {
+                            console.log(`获取第 ${i + 1}/${filteredArticles.length} 篇文章的完整内容...`);
+                            const articleData = await this.fetchArticleContentWithRetry(item.link, 1);
+                            item.content = articleData.content;
+                            if (articleData.title && articleData.title !== '未知标题' && articleData.title !== '访问失败') {
+                                item.title = articleData.title;
+                            }
+                            const savedFileName = this.aborted ? null : await this.saveArticleImmediately(item, this.articles.length + 1);
+                            if (savedFileName && !this.aborted) {
+                                // 最终入库前再次去重
+                                if (!this._seenKeys.has(key)) {
+                                    this._seenKeys.add(key);
+                                    this.articles.push(item);
+                                } else {
+                                    console.log('🔁 重复文章，跳过统计');
+                                }
+                                await this.maybeUpdateSummaryFile();
+                                console.log(`📊 已统计: 第 ${this.articles.length} 篇文章`);
+                            }
+                        } catch (error) {
+                            if (this.aborted) { break; }
+                            console.log(`获取文章内容失败: ${error.message}`);
+                            this.failures.push({
+                                link: item.link,
+                                title: (item.title || '').trim() || '未知标题',
+                                error: String(error && error.message ? error.message : error)
+                            });
+                        }
+                    }
+                };
+                const workers = Array.from({ length: poolSize }, () => runOne());
+                await Promise.all(workers);
+            } else {
+                for (let i = 0; i < filteredArticles.length; i++) {
+                    if (this.aborted) { console.log('已中断，停止当前页剩余文章处理'); break; }
+                    const item = filteredArticles[i];
+                    const key = (item.link && item.link.trim()) || `${(item.title || '').trim()}|${item.publishTime || ''}`;
+                    if (this._seenKeys.has(key)) {
+                        console.log('🔁 重复文章，跳过抓取与统计');
+                        continue;
+                    }
+                    const savedFileName = await this.saveArticleImmediately(item, this.articles.length + 1);
+                    if (savedFileName && !this.aborted) {
+                        this._seenKeys.add(key);
+                        this.articles.push(item);
+                        await this.maybeUpdateSummaryFile();
+                        console.log(`📊 已统计: 第 ${this.articles.length} 篇文章`);
                     }
                 }
             }
-            
-            this.articles.push(...filteredArticles);
+
             totalArticles += articlesOnPage.length;
-            
             console.log(`第 ${currentPage} 页: 找到 ${articlesOnPage.length} 篇文章，符合条件 ${filteredArticles.length} 篇`);
-            console.log(`累计: 总文章 ${totalArticles} 篇，符合条件 ${this.articles.length} 篇`);
-            
-            // 显示最新3篇文章信息
-            if (filteredArticles.length > 0) {
-                console.log('本页符合条件的文章:');
-                filteredArticles.slice(0, 3).forEach((article, index) => {
-                    console.log(`  ${index + 1}. ${article.title.substring(0, 60)}... (${article.publishTime})`);
+            console.log(`累计: 总文章 ${totalArticles} 篇，已保存 ${this.articles.length} 篇`);
+
+            if (this.articles.length > 0 && filteredArticles.length > 0) {
+                console.log('已处理的最新文章:');
+                const recentArticles = this.articles.slice(-Math.min(3, filteredArticles.length));
+                recentArticles.forEach(article => {
+                    const safeTitle = (article.title || '未知标题').trim();
+                    console.log(`  ✅ ${safeTitle.substring(0, 60)}... (${article.publishTime})`);
                 });
             }
 
-            // 检查是否有更旧的文章（如果有文章早于起始日期/阈值，说明后续页面文章会更旧）
             const thresholdDate = this.startDate || this.targetDate || null;
             const hasOlderArticles = thresholdDate ? articlesOnPage.some(article => {
                 if (!article.publishTime) return false;
@@ -153,28 +203,50 @@ class XianzhiCrawler {
                     return false;
                 }
             }) : false;
-            
+
             if (hasOlderArticles && currentPage > 3) {
                 console.log('发现有文章早于目标日期，且已爬取足够页面，停止爬取');
                 break;
             }
-            
-            // 尝试翻页
+
+            if (this.aborted) { console.log('已中断，不再翻页'); break; }
+
             hasMorePages = await this.goToNextPage();
             if (hasMorePages) {
                 currentPage++;
             }
         }
-        
+
         console.log(`\n爬取完成！共获取 ${this.articles.length} 篇文章`);
     }
 
     async fetchArticleContent(articleUrl) {
         try {
+            if (this.aborted) {
+                throw new Error('aborted');
+            }
             // 在新标签页中打开文章
             const articlePage = await this.browser.newPage();
+            // 阻止非必要资源以加速加载
+            try {
+                await articlePage.route('**/*', (route) => {
+                    const req = route.request();
+                    const type = req.resourceType();
+                    // 核心内容在 HTML 中，阻止图片/媒体/字体/样式以提速；
+                    const block = ['image', 'media', 'font', 'stylesheet'];
+                    if (block.includes(type)) {
+                        return route.abort();
+                    }
+                    return route.continue();
+                });
+            } catch (e) {
+                // 路由可能在已设置时抛错，忽略
+            }
+            if (this.aborted) {
+                try { await articlePage.close(); } catch {}
+                throw new Error('aborted');
+            }
             await articlePage.goto(articleUrl, { waitUntil: 'load', timeout: 300000, referer: "https://xz.aliyun.com/" });
-            
             // 提取文章标题
             let title = '';
             try {
@@ -190,8 +262,9 @@ class XianzhiCrawler {
                     const titleElement = articlePage.locator(selector).first();
                     if (await titleElement.isVisible({ timeout: 2000 })) {
                         const titleText = await titleElement.textContent();
-                        if (titleText && titleText.length > 5) {
-                            title = titleText;
+                        const trimmedTitle = titleText ? titleText.trim() : '';
+                        if (trimmedTitle && trimmedTitle.length > 5) {
+                            title = trimmedTitle;
                             break;
                         }
                     }
@@ -201,7 +274,7 @@ class XianzhiCrawler {
                 if (!title) {
                     const pageTitle = await articlePage.title();
                     if (pageTitle && pageTitle.includes('-先知社区')) {
-                        title = pageTitle.replace('-先知社区', '');
+                        title = pageTitle.replace('-先知社区', '').trim();
                     }
                 }
             } catch (error) {
@@ -220,7 +293,7 @@ class XianzhiCrawler {
                 // fs.writeFileSync(path.join(__dirname, 'debug_article.html'), htmlContent, 'utf8');
 
                 if (htmlContent && htmlContent.length > 100) {
-                    console.log('成功获取 ne-viewer-body HTML内容');
+                    // console.log('成功获取 ne-viewer-body HTML内容');
                     content = this.convertHtmlToMarkdown(htmlContent);
                 }
                 
@@ -239,17 +312,46 @@ class XianzhiCrawler {
             };
             
         } catch (error) {
-            console.log(`访问文章页面失败: ${error.message}`);
+            if (!this.aborted) {
+                console.log(`访问文章页面失败: ${error.message}`);
+            }
             return {
                 title: '访问失败',
-                content: '访问文章页面失败: ' + error.message
+                content: this.aborted ? '已中断' : ('访问文章页面失败: ' + error.message)
             };
         }
     }
 
+    // 带重试的获取文章内容
+    async fetchArticleContentWithRetry(articleUrl, retries = 1, baseDelay = 800) {
+        let attempt = 0;
+        let lastErr = null;
+        while (attempt <= retries && !this.aborted) {
+            try {
+                const res = await this.fetchArticleContent(articleUrl);
+                // 认为这些情况是失败，需要重试
+                if (!res || res.title === '访问失败' || !res.content || /无法获取文章内容|提取文章内容失败/i.test(res.content)) {
+                    throw new Error(res && res.title ? res.title : '抓取失败');
+                }
+                return res;
+            } catch (e) {
+                lastErr = e;
+                if (attempt === retries) break;
+                const delay = baseDelay * Math.pow(2, attempt);
+                await this.sleep(delay);
+                attempt++;
+            }
+        }
+        throw lastErr || new Error('抓取失败');
+    }
+
+    sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
     async extractArticlesFromPage() {
         console.log('提取当前页面的文章...');
-        
+        if (this.aborted) return [];
+        await this.page.waitForSelector('li[data-cateid="26"].selected', { timeout: 10000 });
+        await this.page.waitForSelector('#news_list .news_item', { timeout: 10000 });
         // 尝试多个选择器以适应不同页面结构
         const articleSelectors = [
             '.news_item',  // 主要选择器：class="news_item"
@@ -260,6 +362,7 @@ class XianzhiCrawler {
         
         for (const selector of articleSelectors) {
             try {
+                if (this.aborted) return articles;
                 const elements = await this.page.locator(selector).all();
                 if (elements.length > 0) {
                     console.log(`使用选择器 ${selector} 找到 ${elements.length} 个文章元素`);
@@ -297,12 +400,12 @@ class XianzhiCrawler {
                 
                 if (newsLinks.length >= 2) {
                     // 使用第二个链接（通常是文章标题）
-                    title = await newsLinks[1].textContent();
-                    title = title ? title : '';
+                    const titleText = await newsLinks[1].textContent();
+                    title = titleText ? titleText.trim() : '';
                 } else if (newsLinks.length >= 1) {
                     // 如果只有一个链接，使用第一个
-                    title = await newsLinks[0].textContent();
-                    title = title ? title : '';
+                    const titleText = await newsLinks[0].textContent();
+                    title = titleText ? titleText.trim() : '';
                 }
             } catch (error) {
                 console.log('提取标题失败:', error.message);
@@ -356,8 +459,8 @@ class XianzhiCrawler {
             try {
                 const categoryLink = element.locator('a[href*="cate_id="]').first();
                 if (await categoryLink.isVisible({ timeout: 1000 })) {
-                    category = await categoryLink.textContent();
-                    category = category ? category : '';
+                    const categoryText = await categoryLink.textContent();
+                    category = categoryText ? categoryText.trim() : '';
                 }
             } catch (error) {
                 console.log('提取分类失败:', error.message);
@@ -371,32 +474,12 @@ class XianzhiCrawler {
                     const authorText = await authorLink.textContent();
                     if (authorText) {
                         // 提取用户名（去除"发表于 地区"部分）
-                        const lines = authorText.split('\n').filter(line => line);
-                        author = lines[0];
+                        const lines = authorText.split('\n').filter(line => line.trim());
+                        author = lines[0] ? lines[0].trim() : '';
                     }
                 }
             } catch (error) {
                 console.log('提取作者失败:', error.message);
-            }
-            
-            // 提取摘要
-            let summary = '';
-            try {
-                const paragraphs = await element.locator('p').all();
-                for (const p of paragraphs) {
-                    try {
-                        const pText = await p.textContent();
-                        if (pText && pText && pText.length > 20 && 
-                            pText !== title && !pText.includes('浏览')) {
-                            summary = pText.substring(0, 200);
-                            break;
-                        }
-                    } catch (error) {
-                        continue;
-                    }
-                }
-            } catch (error) {
-                console.log('提取摘要失败:', error.message);
             }
             
             if (title && title.length > 5) {
@@ -406,7 +489,6 @@ class XianzhiCrawler {
                     publishTime,
                     category,
                     author,
-                    summary,
                     extractedAt: new Date().toISOString()
                 };
             }
@@ -420,93 +502,170 @@ class XianzhiCrawler {
 
     async goToNextPage() {
         try {
+            if (this.aborted) return false;
             // 查找"下一页"链接
             const nextPageLink = this.page.locator('a:has-text("下一页")').first();
-            
-            if (await nextPageLink.isVisible({ timeout: 3000 })) {
-                console.log('找到下一页链接，正在翻页...');
-                await nextPageLink.click();
-                await this.page.waitForLoadState("networkidle");
-                return true;
-            } else {
+            if (!(await nextPageLink.isVisible({ timeout: 3000 }))) {
                 console.log('没有找到下一页链接，已到最后一页');
                 return false;
             }
+            // 记录翻页前首条文章 href，用于变化判断
+            const prevFirstHref = await this.page.evaluate(() => {
+                const el = document.querySelector('#news_list .news_item a[href*="/news/"]');
+                return el ? el.getAttribute('href') : null;
+            });
+            console.log('找到下一页链接，正在翻页...');
+            await nextPageLink.click();
+            // 等待列表发生变化（多数站点是异步渲染），失败则兜底
+            try {
+                await this.page.waitForFunction((prev) => {
+                    const el = document.querySelector('#news_list .news_item a[href*="/news/"]');
+                    const href = el ? el.getAttribute('href') : null;
+                    return href && href !== prev;
+                }, prevFirstHref, { timeout: 8000 });
+            } catch (e) {
+                try {
+                    const href = await nextPageLink.getAttribute('href');
+                    if (href && !/^javascript|^#/.test(href)) {
+                        const absolute = new URL(href, this.baseUrl).href;
+                        await this.page.goto(absolute, { waitUntil: 'domcontentloaded' });
+                        await this.page.waitForLoadState('networkidle');
+                    } else {
+                        await this.page.waitForLoadState('networkidle');
+                        await this.page.waitForTimeout(1500);
+                    }
+                } catch (e2) {
+                    console.log('翻页兜底跳转失败:', e2.message);
+                }
+            }
+            return true;
         } catch (error) {
             console.log('翻页失败:', error.message);
             return false;
         }
     }
 
+    async saveArticleImmediately(article, index) {
+        try {
+            // 确保papers文件夹存在
+            const papersDir = path.join(__dirname, 'papers');
+            if (!fs.existsSync(papersDir)) {
+                fs.mkdirSync(papersDir, { recursive: true });
+                console.log(`创建文件夹: ${papersDir}`);
+            }
+            
+            const fileName = this.generateFileName(article, index);
+            const filePath = path.join(papersDir, fileName);
+            const articleMarkdown = this.generateSingleArticleMarkdown(article);
+            // 已存在则跳过写入，避免重复 I/O
+            if (fs.existsSync(filePath)) {
+                console.log(`⏭️ 已存在，跳过写入: ${fileName}`);
+            } else {
+                fs.writeFileSync(filePath, articleMarkdown, 'utf8');
+                console.log(`✅ 已保存: ${fileName}`);
+            }
+            
+            return fileName;
+        } catch (error) {
+            console.error(`❌ 保存文章 "${(article.title || '未知标题').trim()}" 失败:`, error.message);
+            return null;
+        }
+    }
+
+    async maybeUpdateSummaryFile(force = false) {
+        this._summaryUpdateCounter++;
+        if (force || this._summaryUpdateCounter % 3 === 0) {
+            await this.updateSummaryFile();
+        }
+    }
+
+    async updateSummaryFile() {
+        try {
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const summaryPath = path.join(__dirname, 'SUMMARY-REALTIME.md');
+            
+            // 生成已保存文章的文件名列表
+            const savedFiles = [];
+            for (let i = 0; i < this.articles.length; i++) {
+                const article = this.articles[i];
+                const fileName = this.generateFileName(article, i + 1);
+                savedFiles.push(fileName);
+            }
+            
+            // 生成汇总内容
+            const summaryContent = this.generateIndexMarkdown(savedFiles);
+            
+            // 写入汇总文件（实时更新）
+            fs.writeFileSync(summaryPath, summaryContent, 'utf8');
+            
+            // 静默更新，不打印太多日志以免干扰主要进度
+        } catch (error) {
+            console.error(`⚠️ 更新汇总文件失败: ${error.message}`);
+        }
+    }
+
     async saveResults() {
+        console.log(`\n📋 生成最终汇总报告...`);
+        
         if (this.articles.length === 0) {
-            console.log('没有文章需要保存');
+            console.log('⚠️ 没有成功处理的文章');
             return;
         }
 
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         
-        // 创建papers文件夹
-        const papersDir = path.join(__dirname, 'papers');
-        if (!fs.existsSync(papersDir)) {
-            fs.mkdirSync(papersDir, { recursive: true });
-            console.log(`创建文件夹: ${papersDir}`);
-        }
-        
-        // 为每篇文章创建单独的Markdown文件
-        console.log(`开始保存 ${this.articles.length} 篇文章到papers文件夹...`);
-        
+        // 生成已保存文章的文件名列表
         const savedFiles = [];
-        
         for (let i = 0; i < this.articles.length; i++) {
             const article = this.articles[i];
-            try {
-                const fileName = this.generateFileName(article, i + 1);
-                const filePath = path.join(papersDir, fileName);
-                const articleMarkdown = this.generateSingleArticleMarkdown(article);
-                
-                fs.writeFileSync(filePath, articleMarkdown, 'utf8');
-                savedFiles.push(fileName);
-                
-                if ((i + 1) % 10 === 0 || i === this.articles.length - 1) {
-                    console.log(`已保存 ${i + 1}/${this.articles.length} 篇文章`);
-                }
-            } catch (error) {
-                console.error(`保存文章 "${article.title}" 失败:`, error.message);
-            }
+            const fileName = this.generateFileName(article, i + 1);
+            savedFiles.push(fileName);
         }
         
-        // 创建索引文件
-        const indexPath = path.join(__dirname, 'SUMMARY-' + timestamp + '.md');
+        // 创建最终的带时间戳的索引文件
+        const finalIndexPath = path.join(__dirname, 'SUMMARY-' + timestamp + '.md');
         const indexContent = this.generateIndexMarkdown(savedFiles);
-        fs.writeFileSync(indexPath, indexContent, 'utf8');
+        fs.writeFileSync(finalIndexPath, indexContent, 'utf8');
         
-        console.log(`\n✅ 完成！已保存 ${savedFiles.length} 篇文章到papers文件夹`);
-        console.log(`📋 索引文件: ${indexPath}`);
+        console.log(`\n🎉 爬取任务完成！`);
+        console.log(`📊 总计处理并保存: ${savedFiles.length} 篇文章`);
+        console.log(`📁 文章保存位置: papers/ 文件夹`);
+        console.log(`📋 实时汇总文件: SUMMARY-REALTIME.md`);
+        console.log(`📋 最终汇总文件: ${path.basename(finalIndexPath)}`);
         
         // 生成统计报告
         this.generateReport();
+
+        // 输出失败列表
+        if (this.failures && this.failures.length) {
+            const failPath = path.join(__dirname, `failures-${timestamp}.json`);
+            fs.writeFileSync(failPath, JSON.stringify(this.failures, null, 2), 'utf8');
+            console.log(`⚠️ 抓取失败 ${this.failures.length} 条，已导出: ${path.basename(failPath)}`);
+        }
     }
 
     generateFileName(article, index) {
         // 生成安全的文件名，只使用标题
-        let fileName = article.title
+        const safeTitle = (article.title || '').trim();
+        let fileName = safeTitle
             .replace(/[<>:"/\\|?*]/g, '') // 移除不安全字符
             .replace(/[\s()（）\[\]【】]/g, '_') // 空格和括号替换为下划线
             .replace(/_+/g, '_') // 多个下划线合并为一个
-            .replace(/^_|_$/g, '') // 移除开头和结尾的下划线
+                .replace(/^_|_$/g, '') // 移除开头和结尾的下划线
             .substring(0, 80); // 限制长度
         
         // 确保文件名不为空
         if (!fileName) {
-            fileName = `article_${index}`;
+            const linkHash = this.sha1(String(article.link || 'unknown')).slice(0, 12);
+            fileName = `article_${linkHash}`;
         }
         
         return `${fileName}.md`;
     }
 
     generateSingleArticleMarkdown(article) {
-        let markdown = `# ${article.title}\n\n`;
+        const safeTitle = (article.title || '未知标题').trim();
+        let markdown = `# ${safeTitle}\n\n`;
         
         // 文章完整内容
         if (article.content && article.content) {
@@ -582,10 +741,11 @@ class XianzhiCrawler {
         
         sortedArticles.forEach((article, index) => {
             const fileName = this.generateFileName(article, index + 1);
-            const shortTitle = article.title.length > 50 ? 
-                article.title.substring(0, 50) + '...' : article.title;
+            const safeTitle = (article.title || '未知标题').trim();
+            const shortTitle = safeTitle.length > 50 ? 
+                safeTitle.substring(0, 50) + '...' : safeTitle;
             
-            markdown += `| ${index + 1} | [${shortTitle}](${fileName}) | ${article.category || '未分类'} | ${article.author || '未知'} | ${article.publishTime || '未知'} | [📄](${fileName}) |\n`;
+            markdown += `| ${index + 1} | [${shortTitle}](papers/${fileName}) | ${article.category || '未分类'} | ${article.author || '未知'} | ${article.publishTime || '未知'} | [📄](papers/${fileName}) |\n`;
         });
         
         markdown += `\n---\n\n`;
@@ -616,8 +776,9 @@ class XianzhiCrawler {
         // 生成目录
         markdown += `## 📋 目录\n\n`;
         sortedArticles.forEach((article, index) => {
-            const anchor = this.generateAnchor(article.title);
-            markdown += `${index + 1}. [${article.title}](#${anchor})\n`;
+            const safeTitle = (article.title || '未知标题').trim();
+            const fileName = this.generateFileName(article, index + 1);
+            markdown += `${index + 1}. [${safeTitle}](papers/${fileName})\n`;
         });
         markdown += `\n---\n\n`;
 
@@ -648,7 +809,8 @@ class XianzhiCrawler {
 
     generateAnchor(title) {
         // 生成URL友好的锚点
-        return title
+        const safeTitle = (title || '未知').trim();
+        return safeTitle
             .toLowerCase()
             .replace(/[^\w\u4e00-\u9fa5\s-]/g, '') // 保留中文、字母、数字、空格、连字符
             .replace(/\s+/g, '-') // 空格替换为连字符
@@ -657,7 +819,8 @@ class XianzhiCrawler {
     }
 
     generateArticleMarkdown(article, index) {
-        let markdown = `### ${index}. ${article.title}\n\n`;
+        const safeTitle = (article.title || '未知标题').trim();
+        let markdown = `### ${index}. ${safeTitle}\n\n`;
         
         // 文章元信息表格
         markdown += `| 项目 | 内容 |\n`;
@@ -952,6 +1115,9 @@ class XianzhiCrawler {
                 
             // CodeMirror 相关元素
             case 'div':
+                if (attributes['class'] && attributes['class'].includes('ne-image-error')) {
+                    return ''; // 忽略图片加载失败提示
+                }
             case 'span':
                 const className = attributes['class'] || '';
                 
@@ -1089,7 +1255,7 @@ class XianzhiCrawler {
     extractCodeFromCard(content, attributes = {}) {
         // 从ne-card代码块中提取实际的代码内容
         if (!content) {
-            console.log('代码块内容为空');
+            // console.log('代码块内容为空');
             return '';
         }
         
@@ -1105,7 +1271,7 @@ class XianzhiCrawler {
             const codeblockElement = document.querySelector('[data-codeblock-mode]');
             if (codeblockElement) {
                 language = codeblockElement.getAttribute('data-codeblock-mode') || '';
-                console.log('找到代码块语言(codeblock-mode):', language);
+                // console.log('找到代码块语言(codeblock-mode):', language);
             }
             
             // 如果没有找到，尝试从data-language属性获取
@@ -1113,7 +1279,7 @@ class XianzhiCrawler {
                 const contentElement = document.querySelector('[data-language]');
                 if (contentElement) {
                     language = contentElement.getAttribute('data-language') || '';
-                    console.log('找到代码块语言(data-language):', language);
+                    // console.log('找到代码块语言(data-language):', language);
                     // 处理shell -> bash的转换
                     if (language === 'shell') {
                         language = 'bash';
@@ -1123,7 +1289,7 @@ class XianzhiCrawler {
             
             // 提取代码行内容
             const codeLines = document.querySelectorAll('.cm-line');
-            console.log(`代码块中找到 ${codeLines.length} 行代码`);
+            // console.log(`代码块中找到 ${codeLines.length} 行代码`);
             
             if (codeLines.length > 0) {
                 const lines = [];
@@ -1152,7 +1318,7 @@ class XianzhiCrawler {
                     }
                     
                     if (index < 3) { // 只打印前3行作为调试
-                        console.log(`  行 ${index + 1}: "${lineText}"`);
+                        // console.log(`  行 ${index + 1}: "${lineText}"`);
                     }
                     lines.push(lineText || ''); // 保留空行
                 });
@@ -1290,7 +1456,7 @@ class XianzhiCrawler {
             .sort((a, b) => new Date(b.publishTime) - new Date(a.publishTime))
             .slice(0, 5)
             .forEach((article, index) => {
-                console.log(`  ${index + 1}. ${article.title} (${article.publishTime})`);
+                console.log(`  ${index + 1}. ${(article.title || '未知标题').trim()} (${article.publishTime})`);
             });
     }
 
@@ -1320,10 +1486,12 @@ class XianzhiCrawler {
         let downloaded = 0;
         for (const mdName of all) {
             const mdPath = path.join(papersDir, mdName);
-            const raw = fs.readFileSync(mdPath, 'utf8');
+            // 去掉内联 SVG 占位（例如“图片加载失败”图标），避免误识别为需下载图片
+            const raw = fs.readFileSync(mdPath, 'utf8').replace(/!\[[^\]]*\]\(data:image\/svg\+xml;[^)]+\)/gi, '');
 
+            // http/https 图片
             const imageRegex = /!\[[^\]]*\]\((https?:[^)\s]+)(?:\s+"[^"]*")?\)/g;
-            const replacements = [];
+            const tasks = [];
             let match;
             while ((match = imageRegex.exec(raw)) !== null) {
                 totalImages++;
@@ -1334,14 +1502,87 @@ class XianzhiCrawler {
                 const fileName = `${hashed}${ext}`;
                 const localPath = path.join(imagesDir, fileName);
                 const localRel = `images/${fileName}`;
+                tasks.push({ full, url, localPath, localRel, ok: false });
+            }
+
+            // data:image 图片（支持 base64 与非 base64 载荷）
+            const dataRegex = /!\[[^\]]*\]\((data:image\/[a-zA-Z0-9.+-]+(?:;charset=[^;,)]+)?(?:;base64)?,[^)]+)(?:\s+"[^"]*")?\)/g;
+            const dataTasks = [];
+            while ((match = dataRegex.exec(raw)) !== null) {
+                totalImages++;
+                const full = match[0];
+                const dataUrl = match[1];
+                // MIME
+                const mimeMatch = /^data:([^;,]+)(?:;charset=[^;,]+)?(?:;base64)?,/i.exec(dataUrl);
+                const mime = mimeMatch ? mimeMatch[1].toLowerCase() : 'image/jpeg';
+                let ext = '.jpg';
+                if (mime.includes('png')) ext = '.png';
+                else if (mime.includes('jpeg') || mime.includes('jpg')) ext = '.jpg';
+                else if (mime.includes('gif')) ext = '.gif';
+                else if (mime.includes('webp')) ext = '.webp';
+                else if (mime.includes('bmp')) ext = '.bmp';
+                else if (mime.includes('svg')) ext = '.svg';
+                else if (mime.includes('x-icon') || mime.includes('vnd.microsoft.icon') || mime.includes('ico')) ext = '.ico';
+                const hashed = this.sha1(dataUrl).slice(0, 32);
+                const fileName = `${hashed}${ext}`;
+                const localPath = path.join(imagesDir, fileName);
+                const localRel = `images/${fileName}`;
+                dataTasks.push({ full, dataUrl, localPath, localRel, ok: false });
+            }
+
+            if (tasks.length === 0 && dataTasks.length === 0) continue;
+
+            // 并发下载当前文件中的图片
+            let tIdx = 0;
+            const pool = Math.max(1, this.concurrency);
+            const worker = async () => {
+                while (tIdx < tasks.length) {
+                    const i = tIdx++;
+                    const t = tasks[i];
+                    try {
+                        if (!fs.existsSync(t.localPath)) {
+                            await this.downloadWithReferer(t.url, t.localPath, 'https://xz.aliyun.com/');
+                            downloaded++;
+                        }
+                        t.ok = true;
+                    } catch (e) {
+                        console.log(`下载失败: ${t.url} -> ${e.message}`);
+                        t.ok = false;
+                    }
+                }
+            };
+            await Promise.all(Array.from({ length: pool }, () => worker()));
+
+            // 处理 data:image 写入
+            for (const t of dataTasks) {
                 try {
-                    if (!fs.existsSync(localPath)) {
-                        await this.downloadWithReferer(url, localPath, 'https://xz.aliyun.com/');
+                    if (!fs.existsSync(t.localPath)) {
+                        const commaIdx = t.dataUrl.indexOf(',');
+                        const header = t.dataUrl.substring(0, commaIdx);
+                        const payload = t.dataUrl.substring(commaIdx + 1);
+                        const isBase64 = /;base64/i.test(header);
+                        const buf = isBase64 ? Buffer.from(payload, 'base64') : Buffer.from(decodeURIComponent(payload), 'utf8');
+                        if (buf.length === 0) throw new Error('Empty data');
+                        fs.writeFileSync(t.localPath, buf);
                         downloaded++;
                     }
-                    replacements.push({ full, url, repl: full.replace(url, localRel) });
+                    t.ok = true;
                 } catch (e) {
-                    console.log(`下载失败: ${url} -> ${e.message}`);
+                    console.log(`写入 data:image 图片失败: ${e.message}`);
+                    t.ok = false;
+                }
+            }
+
+            // 仅对成功的下载/写入做替换
+            const replacements = [];
+            for (const t of tasks) {
+                if (t.ok) {
+                    replacements.push({ full: t.full, repl: t.full.replace(t.url, t.localRel) });
+                }
+            }
+            for (const t of dataTasks) {
+                if (t.ok) {
+                    replacements.push({ full: t.full, repl: t.full.replace(t.dataUrl, t.localRel) });
                 }
             }
 
@@ -1417,25 +1658,59 @@ class XianzhiCrawler {
     async run() {
         try {
             if (this.imagesOnly) {
-                // 仅处理 papers 下的 Markdown 图片本地化
                 await this.localizeImagesInPapers();
                 return;
             }
 
+            this.setupSignalHandlers();
             await this.init();
             await this.navigateToNews();
             await this.scrapeArticles();
             await this.saveResults();
+            // 抓取完成后，按需本地化图片
+            if (this.image && !this.aborted) {
+                console.log('开始对已下载文章进行图片本地化...');
+                await this.localizeImagesInPapers();
+            }
         } catch (error) {
             console.error('爬取过程中出错:', error);
         } finally {
             if (!this.imagesOnly) {
                 await this.close();
             }
+            this.teardownSignalHandlers();
+        }
+    }
+
+    setupSignalHandlers() {
+        if (this._onSigint || this._onSigterm) return;
+        this._onSigint = () => {
+            if (!this.aborted) {
+                this.aborted = true;
+                console.log(`\n⚠️ 收到 Ctrl-C（SIGINT），正在安全停止（已保存 ${this.articles.length} 篇）...`);
+            }
+        };
+        this._onSigterm = () => {
+            if (!this.aborted) {
+                this.aborted = true;
+                console.log(`\n⚠️ 收到 SIGTERM，正在安全停止（已保存 ${this.articles.length} 篇）...`);
+            }
+        };
+        process.on('SIGINT', this._onSigint);
+        process.on('SIGTERM', this._onSigterm);
+    }
+
+    teardownSignalHandlers() {
+        if (this._onSigint) {
+            process.off('SIGINT', this._onSigint);
+            this._onSigint = null;
+        }
+        if (this._onSigterm) {
+            process.off('SIGTERM', this._onSigterm);
+            this._onSigterm = null;
         }
     }
 }
-
 // 运行爬虫
 async function main() {
     // 创建爬虫实例，支持 CLI/ENV/配置文件 参数化
@@ -1495,26 +1770,34 @@ async function main() {
 
     const imagesOnlyRaw = args['images-only'] !== undefined ? args['images-only'] : pick(['imagesOnly'], false);
     const imagesOnly = imagesOnlyRaw === true || imagesOnlyRaw === 'true';
+    const imageRaw = args['image'] !== undefined ? args['image'] : pick(['image'], false);
+    const image = imageRaw === true || imageRaw === 'true';
     const maxPagesRaw = pick(['maxPages', 'max-pages'], 1);
     const maxPages = Number(maxPagesRaw) > 0 ? Number(maxPagesRaw) : 1;
     const startDate = pick(['startDate', 'start-date'], undefined);
     const endDate = pick(['endDate', 'end-date'], undefined);
     const targetDate = pick(['targetDate', 'target-date'], undefined);
+    const concurrencyRaw = pick(['concurrency', 'conc', 'parallel'], 3);
+    const concurrency = Number(concurrencyRaw) > 0 ? Number(concurrencyRaw) : 3;
 
     const crawler = new XianzhiCrawler({
         fetchFullContent: !imagesOnly,
         maxPages,
         imagesOnly,
+        image,
         startDate,
         endDate,
         targetDate,
+        concurrency,
     });
     console.log('配置:', {
         imagesOnly,
+        image,
         maxPages,
         startDate,
         endDate,
         targetDate,
+        concurrency,
     });
     await crawler.run();
 }

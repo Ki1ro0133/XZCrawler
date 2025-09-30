@@ -20,3 +20,6 @@ yarn-error.log*
 SUMMARY*.md
 papers/
 package-lock.json
+
+# dev log
+devlog.txt
